@@ -22,7 +22,7 @@ from .chunk import Chunk, ChunkManager, TensorState, init_chunk_manager
 from .gemini_hook import GeminiZeROHook
 from .gemini_mgr import GeminiManager
 from .memory_tracer import MemStats, OrderedParamGenerator
-from .utils import get_temp_total_chunk_on_cuda
+from .utils import get_temp_total_chunk_on_cuda, is_lora_ignored
 
 try:
     from torch.nn.modules.module import _EXTRA_STATE_KEY_SUFFIX, _IncompatibleKeys
@@ -77,6 +77,7 @@ class GeminiDDP(ModelWrapper):
         memstats: Optional[MemStats] = None,  # genimi memory stats
         master_weights: bool = True,
         verbose: bool = False,
+        enable_lora: bool = False,
     ) -> None:
         assert mixed_precision in (torch.float16, torch.bfloat16)
         if chunk_config_dict is not None:
@@ -109,6 +110,7 @@ class GeminiDDP(ModelWrapper):
         self.param_op_hook = GeminiZeROHook(self.gemini_manager)
         self.fp32_params: List[torch.Tensor] = list()
         self.fp16_params: List[ColoParameter] = list()
+        self.lora_ignored_params: List[ColoParameter] = list()
         self.overflow_counter = 0
         self.grads_device: Dict[torch.Tensor, torch.device] = dict()
         self.param2name: Dict[nn.Parameter, str] = dict()
@@ -124,6 +126,7 @@ class GeminiDDP(ModelWrapper):
         if self.enable_gradient_accumulation:
             self.reuse_fp16_chunk = False
         self.accumulating_grads = False  # Whether model is accumulating gradients
+        self.enable_lora = enable_lora
 
         self._logger = get_dist_logger()
 
@@ -195,6 +198,18 @@ class GeminiDDP(ModelWrapper):
         """
         for p in params_to_ignore:
             p._ddp_to_ignore = True
+
+    @staticmethod
+    def set_params_to_lora_ignored(params_to_ignore: Iterable[torch.Tensor]) -> None:
+        """Sets parameters to be ignored by lora training:
+            their gradients are not required, but they should be organized in chunks, thus not ignored by ddp.
+           This method must be called when enabling Lora.
+
+        Args:
+            params_to_ignore (Iterable[torch.Tensor]): A list of parameters to be ignored.
+        """
+        for p in params_to_ignore:
+            p._ignored_by_lora = True
 
     def _get_non_persistent_buffers_set(
         self, module, memo: Optional[Set[nn.Module]] = None, prefix: str = "", remove_duplicate: bool = True
@@ -284,6 +299,27 @@ class GeminiDDP(ModelWrapper):
                 continue
             p.grad = None
 
+    def _clean_lora_ignored_param_chunks(self):
+        # When training with lora, some early model layers such as embedding might not calculate gradient during backward,
+        # so their post_op of backward pass are not triggered.
+        # Thus we need to manually do the scattering and releasing of their chunks.
+        for p in self.param2name:
+            if not is_lora_ignored(p):
+                continue
+            chunk = self.chunk_manager.get_chunk(p)
+            tensor_state = chunk.tensors_info[p].state
+            if tensor_state == TensorState.READY_FOR_REDUCE:
+                # Tranfer chunk state to HOLD.
+                for tensor in chunk.tensors_info.keys():
+                    chunk.tensor_trans_state(tensor, TensorState.HOLD)
+                # Scatter chunk.
+                if chunk.keep_gathered:
+                    self.chunk_manager.fake_release_chunk(chunk)
+                else:
+                    self.chunk_manager.release_chunk(chunk)
+                # Move chunk to its resident device.
+                self.chunk_manager.move_chunk(chunk, self.grads_device[p], force_copy=True)
+
     def _pre_backward(self):
         # set a visit label for all parameters
         # the label is used to check whether the parameter is correctly reduced
@@ -292,10 +328,15 @@ class GeminiDDP(ModelWrapper):
                 setattr(param, "_gemini_reduced", False)
 
     def _post_backward(self):
+        self._clean_lora_ignored_param_chunks()
         if self.chunk_manager.accessed_mem != 0:
             error_params = ["Reduction failed at followed parameters:"]
             for param in self.param2name:
-                if not is_ddp_ignored(param) and not getattr(param, "_gemini_reduced"):
+                if (
+                    (not is_ddp_ignored(param))
+                    and (not is_lora_ignored(param))
+                    and (not getattr(param, "_gemini_reduced"))
+                ):
                     error_params.append(self.param2name[param])
             error_str = "\n\t".join(error_params)
             raise RuntimeError(
@@ -343,6 +384,7 @@ class GeminiDDP(ModelWrapper):
                         grad_chunk = self.chunk_manager.rearrange_accumulated_grad_chunk(chunk)
                     else:
                         grad_chunk = chunk.grad_chunk
+                        chunk.grad_chunk.l2_norm = None
 
                 # hold -> compute -> hold after bwd
                 grad_chunk.tensor_trans_state(p, TensorState.COMPUTE)
@@ -411,13 +453,51 @@ class GeminiDDP(ModelWrapper):
                 destination = hook_result
         return destination
 
-    def _get_chunk_to_save_data(self, chunk: Chunk, only_rank_0: bool) -> Dict:
+    def state_dict_for_lora(self, destination=None, prefix="", keep_vars=False, only_rank_0: bool = True):
+        """Returns a state dict only containing lora modules and modules to save.
+           bias parameters are selectively kept according to the config.bias.
+
+           This method is modified based on `peft.utils.get_peft_model_state_dict` method of peft library.
+
+        Returns:
+            dict:
+                a dictionary containing lora modules and modules to save
+        """
+        from peft import PeftModel
+
+        assert isinstance(
+            self.module, PeftModel
+        ), "Method state_dict_for_lora can only be called on models wrapped with peft."
+
+        adapter_name = "default"  # Gemini Plugin will only use default as adapter_name
+        peft_config = self.module.peft_config[adapter_name]
+        bias_config = getattr(peft_config, "bias", "none")
+        modules_to_save = self.module.modules_to_save
+
+        if destination is None:
+            destination = OrderedDict()
+            destination._metadata = OrderedDict()
+
+        destination._metadata[prefix[:-1]] = local_metadata = dict(version=self._version)
+        self._save_to_lora_state_dict(destination, prefix, keep_vars, bias_config, modules_to_save, only_rank_0)
+
+        for hook in self._state_dict_hooks.values():
+            hook_result = hook(self, destination, prefix, local_metadata)
+            if hook_result is not None:
+                destination = hook_result
+
+        destination = {k.replace(f".{adapter_name}", ""): v for k, v in destination.items()}
+        destination = {k.replace(".modules_to_save", ""): v for k, v in destination.items()}
+        return destination
+
+    def _get_chunk_to_save_data(self, chunk: Chunk, only_rank_0: bool, target_params: Set[nn.Parameter] = None) -> Dict:
         """
         get gathered chunk content.
 
         Args:
             chunk (Chunk): a chunk
             only_rank_0 (bool): whether to only save data on rank 0
+            target_params (Set[nn.Parameter]) : If not None, only the params in target_params will be collected. Defaults to None.
 
         Returns:
             Dict: a dict whose key is param name and value is param with correct payload
@@ -427,6 +507,8 @@ class GeminiDDP(ModelWrapper):
         temp_chunk = get_temp_total_chunk_on_cuda(chunk, self.mixed_precision)
 
         for tensor, tensor_info in chunk.tensors_info.items():
+            if (target_params is not None) and (tensor not in target_params):
+                continue
             record_tensor = torch.empty([0])
             record_flag = (not only_rank_0) | (dist.get_rank(chunk.torch_pg) == 0)
             if record_flag:
@@ -453,7 +535,7 @@ class GeminiDDP(ModelWrapper):
         param_to_save_data = dict()
         chunk_list = self.chunk_manager.get_chunks(param_list)
         for chunk in chunk_list:
-            param_to_save_data.update(self._get_chunk_to_save_data(chunk, only_rank_0))
+            param_to_save_data.update(self._get_chunk_to_save_data(chunk, only_rank_0, set(param_list)))
         return param_to_save_data
 
     def _save_to_state_dict(self, destination, prefix, keep_vars, only_rank_0=True):
@@ -474,6 +556,8 @@ class GeminiDDP(ModelWrapper):
         # get copies of fp32 parameters in CPU
         # as memory of fp16_params may be reused by grad, it's not reliable, we should use fp32_params and convert to fp16
         params = self.fp32_params if self.reuse_fp16_chunk else self.fp16_params
+        if self.enable_lora:
+            params += self.lora_ignored_params
         param_to_save_data = self._get_param_to_save_data(params, only_rank_0)
         # get the mapping between copies and fp16 parameters
         p_mapping = dict()
@@ -483,6 +567,9 @@ class GeminiDDP(ModelWrapper):
                 assert fp32_p in param_to_save_data, "Parameter '{}' is neglected in the chunk list".format(name)
                 record_parameter = param_to_save_data[fp32_p]
                 p_mapping[p] = record_parameter
+            if self.enable_lora:
+                for p in self.lora_ignored_params:
+                    p_mapping[p] = param_to_save_data[p]
         else:
             p_mapping = param_to_save_data
         for name, param in self.name2param.items():
@@ -506,6 +593,74 @@ class GeminiDDP(ModelWrapper):
             is not torch.nn.Module.get_extra_state
         ):
             destination[extra_state_key] = self.get_extra_state()
+
+    def _save_to_lora_state_dict(
+        self, destination, prefix, keep_vars, bias_config="none", modules_to_save=None, only_rank_0=True
+    ):
+        r"""Saves module states needed by lora checkpoint to `destination` dictionary, containing a state
+        of the module, but not its descendants.
+
+        This method is modified based on `peft.utils.get_peft_model_state_dict` method of peft library.
+
+        Args:
+            destination (dict): a dict where state will be stored
+            prefix (str): the prefix for parameters and buffers used in this
+                module
+            bias_config (str, optional): A string indicating the bias parameters to finetune and save.
+                If set to "none", no bias parameters are saved; If set to "all", all bias parameters are saved;
+                If set to "lora_only", only bias parameters attached to a module owning lora are saved.
+                Defaults to "none".
+            modules_to_save (Optional[List[str]], optional): A list of string containing patterns for modules to
+                be saved for lora checkpoint. Defaults to None.
+            only_rank_0 (bool, optional): Whether to collect state dict only on master rank. Defaults to True.
+        """
+        assert keep_vars is False, "`state_dict` with parameter, `keep_vars=True`, is not supported now."
+
+        # pick the parameters needed by lora checkpoint
+        # if fp16_chunks are reused by gradients, pick the fp32 parameters, else pick fp16 parameters
+        lora_params = []
+        saved_param_names = []
+
+        # get the mapping between copies and fp16 parameters, this mapping will be empty when self.reuse_fp16_chunks is False.
+        fp16_to_fp32 = dict()
+        for p, fp32_p in zip(self.fp16_params, self.fp32_params):
+            fp16_to_fp32[p] = fp32_p
+
+        for p in self.fp16_params:
+            name = self.param2name[p]
+            save_flag = False
+
+            # lora modules should be saved
+            if "lora_" in name:
+                save_flag = True
+
+            # bias parameters should be selectively saved based on bias config
+            if "bias" in name:
+                if bias_config == "all":
+                    save_flag = True
+
+                if bias_config == "lora_only":
+                    save_flag = getattr(self.module, name.split("bias")[0] + "lora_A", None) is not None
+
+            # modules with pattern in self.modules_to_save_for_lora should be saved
+            if modules_to_save is not None:
+                save_flag = save_flag or any(
+                    f"{module_name}.modules_to_save" in name for module_name in modules_to_save
+                )
+
+            if save_flag:
+                if self.reuse_fp16_chunk:
+                    lora_params.append(fp16_to_fp32[p])
+                else:
+                    lora_params.append(p)
+                saved_param_names.append(name)
+
+        param_to_save_data = self._get_param_to_save_data(lora_params, only_rank_0)
+
+        for name, p in zip(saved_param_names, lora_params):
+            destination[prefix + name] = param_to_save_data[p]
+
+        del param_to_save_data
 
     def load_state_dict(self, state_dict: "OrderedDict[str, torch.Tensor]", strict: bool = True):
         r"""Copies parameters and buffers from :attr:`state_dict` into
@@ -699,13 +854,32 @@ class GeminiDDP(ModelWrapper):
             self._preprocess_param(p)
             assert type(p) is ColoParameter
 
-            # ignore the parameters with no gradient
+            # ignore the parameters with no gradient when not using lora
+            # when using lora, the model parameters should be processed in a special way since they don't need gradients but are organized in chunks
             if not p.requires_grad:
-                self.set_params_to_ignore([p])
+                if not self.enable_lora:
+                    self.set_params_to_ignore([p])
+                else:
+                    self.set_params_to_lora_ignored([p])
 
             # move ignored parameters to CUDA
             if is_ddp_ignored(p):
                 p.data = p.data.to(device=get_current_device(), dtype=self.mixed_precision)
+                continue
+
+            if is_lora_ignored(p):
+                # create a fp16 parameter
+                p.data = p.data.to(self.mixed_precision)
+                # register the fp16 parameter
+                self.chunk_manager.register_tensor(
+                    tensor=p,
+                    group_type="lora_ignored_param",
+                    config_key=dp_world_size,
+                    process_group=self.dp_process_group,
+                    cpu_offload=cpu_offload,
+                    pin_memory=pin_memory,
+                )
+                self.lora_ignored_params.append(p)
                 continue
 
             # create a fp16 parameter
@@ -737,6 +911,10 @@ class GeminiDDP(ModelWrapper):
         self.chunk_manager.close_all_groups()
 
         self.gemini_manager.setup_grads_device(self.fp16_params, self.grads_device)
+
+        # setup devices for model parameters when using lora
+        if self.enable_lora:
+            self.gemini_manager.setup_grads_device(self.lora_ignored_params, self.grads_device)
 
         # move master weights to corresponding device and setup paired chunks
         # if no master weights, fp32_params should be empty and this loop will be skipped
