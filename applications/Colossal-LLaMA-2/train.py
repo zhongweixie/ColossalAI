@@ -23,7 +23,8 @@ from colossal_llama2.utils.froze import freeze_non_embeds_parameters
 from colossal_llama2.utils.neftune_patch import activate_neftune, deactivate_neftune
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from transformers import LlamaForCausalLM, LlamaTokenizer
+from transformers import LlamaForCausalLM
+from transformers import AutoTokenizer
 
 import colossalai
 from colossalai.accelerator import get_accelerator
@@ -196,7 +197,7 @@ def main() -> None:
     # ======================================================
     # Initialize Tokenizer, Dataset, Collator and Dataloader
     # ======================================================
-    tokenizer = LlamaTokenizer.from_pretrained(args.pretrained)
+    tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
     if args.pad_token == "eos":
         tokenizer.pad_token = tokenizer.eos_token
     elif args.pad_token == "unk":
