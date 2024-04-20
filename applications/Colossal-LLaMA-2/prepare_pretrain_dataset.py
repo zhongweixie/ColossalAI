@@ -16,7 +16,7 @@ from colossal_llama2.dataset.spliced_and_tokenized_dataset import (
     supervised_tokenize_pretrain,
 )
 from datasets import dataset_dict, load_dataset
-from transformers.models.llama.tokenization_llama import LlamaTokenizer
+from transformers import AutoTokenizer
 
 from colossalai.logging import get_dist_logger
 
@@ -55,15 +55,12 @@ def main():
     if args.num_spliced_dataset_bins >= 100000:
         raise ValueError("Too many spliced divisions, must be smaller than 100000")
 
-    assert not os.path.exists(args.data_cache_dir), f"Find existed data cache dir {args.data_cache_dir}"
-    assert not os.path.exists(
-        args.data_jsonl_output_dir
-    ), f"Find existed jsonl data output dir {args.data_jsonl_output_dir}"
-    assert not os.path.exists(
-        args.data_arrow_output_dir
-    ), f"Find existed arrow data output dir {args.data_arrow_output_dir}"
-    os.makedirs(args.data_jsonl_output_dir)
-    os.makedirs(args.data_arrow_output_dir)
+    if not os.path.exists(args.data_cache_dir):
+        os.makedirs(args.data_cache_dir)
+    if not os.path.exists(args.data_jsonl_output_dir):
+        os.makedirs(args.data_jsonl_output_dir)
+    if not os.path.exists(args.data_arrow_output_dir):
+        os.makedirs(args.data_arrow_output_dir)
 
     # Prepare to all input datasets
     input_data_paths = []
@@ -86,7 +83,7 @@ def main():
         train_splits.append(f"train[{start}%:{end}%]")
 
     # Prepare to the tokenizer.
-    tokenizer = LlamaTokenizer.from_pretrained(args.tokenizer_dir)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_dir)
     tokenizer.add_bos_token = False
     tokenizer.add_eos_token = False
     if tokenizer.pad_token is None:
