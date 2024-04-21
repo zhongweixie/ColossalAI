@@ -1,4 +1,5 @@
 torch==2.1.2
+huggingface-hub==0.22.2
 packaging==24.0
 colossalai==0.3.6
 autoflake==2.2.1
@@ -12,3 +13,4 @@ flash-attn>=2.0.0,<=2.0.5
 tqdm
 sentencepiece==0.1.99
 protobuf<=3.20.0
+
