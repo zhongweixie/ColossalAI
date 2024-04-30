@@ -72,7 +72,7 @@ def get_ep_size(tensor: torch.Tensor) -> int:
     Returns:
         int: The expert parallel size of the given tensor.
     """
-    assert getattr(tensor, "ep_group") is not None , "The tensor does not have expert parallel group."
+    assert getattr(tensor, "ep_group") is not None, "The tensor does not have expert parallel group."
     return dist.get_world_size(tensor.ep_group)
 
 
