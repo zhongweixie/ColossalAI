@@ -49,7 +49,6 @@ def run_fwd_bwd(
             lambda x, y: x.loss,
             optimizer,
             return_loss=True,
-            return_outputs=True,
         )
         # Backward and optimize
         if is_pp_last_stage:
@@ -114,7 +113,7 @@ def get_model(parallel):
             pp_size=1,
             ep_size=2,
             zero_stage=2,
-            extra_dp_size=2,
+            moe_dp_size=2,
             custom_policy=OpenMoeForCausalLMPolicy(),
         )
     elif parallel == "hybrid":
@@ -189,7 +188,7 @@ def _run_dist(rank, world_size, port, parallel):
     _test_moe_checkpoint(rank, parallel)
 
 
-@pytest.mark.skip(reason="This is tested in ColossalMOE")
+# @pytest.mark.skip(reason="This is tested in ColossalMOE")
 @pytest.mark.dist
 @pytest.mark.parametrize("world_size", [4])
 @pytest.mark.parametrize("parallel", [None, "ep", "ep_zero", "hybrid"])

@@ -79,6 +79,7 @@ class LowLevelZeroOptimizer(OptimizerWrapper):
         master_weights: bool = True,  # master weights
     ):
         super(LowLevelZeroOptimizer, self).__init__(optim=optimizer)
+
         self._dtype = self.optim.param_groups[0]["params"][0].dtype
         self._logger = get_dist_logger()
         self._verbose = verbose
@@ -97,9 +98,9 @@ class LowLevelZeroOptimizer(OptimizerWrapper):
         self._world_size = dist.get_world_size(group=self.dp_pg)
 
         # extra dp
-        # This group is used to sync moe param, dp_world_size = moe_duplicates * extra_dp_size.
+        # This group is used to sync moe param, dp_world_size = ep_size * extra_dp_size.
         # Non moe param will be sync by global dp pg, moe param will be sync by extra dp pg.
-        # Moe param grad is be split as non moe param by global dp pg, and grad will be merged in step.
+        # Moe param grad is split as non moe param by global dp pg, and grad will be merged in step.
         # And moe working and master param are split by extra dp pg.
         self.moe_extra_dp_pg = moe_extra_dp_process_group
         if self.moe_extra_dp_pg is not None:
@@ -494,7 +495,6 @@ class LowLevelZeroOptimizer(OptimizerWrapper):
         # clear reduced grads
         if self._overlap_communication:
             get_accelerator().synchronize()
-
         self.zero_grad()
 
     def backward_by_grad(self, tensor, grad):
@@ -908,7 +908,7 @@ class LowLevelZeroOptimizer(OptimizerWrapper):
                 if padding_size > 0:
                     working_param = torch.nn.functional.pad(working_param, [0, padding_size])
                 if self.moe_extra_dp_pg is not None and is_moe_tensor(p):
-                    master_param.copy_(working_param.chunk(self.extra_dp_pg_size)[self.extra_dp_pg_rank])
+                    master_param.copy_(working_param.chunk(self.moe_extra_dp_pg_size)[self.moe_extra_dp_pg_rank])
                 else:
                     master_param.copy_(working_param.chunk(self._world_size)[self._local_rank])
         if hasattr(self, "master_moe_params"):
