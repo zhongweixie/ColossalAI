@@ -249,6 +249,7 @@ class LowLevelZeroOptimizer(OptimizerWrapper):
                 else:
                     splited_param_current_rank = splited_params
 
+                # Send the splited view to the optimizer to match ZeRO 2 grad shape
                 params_current_rank.append(splited_param_current_rank)
                 self._param_store.link_master_and_working_param(splited_param_current_rank, param)
 
@@ -398,8 +399,8 @@ class LowLevelZeroOptimizer(OptimizerWrapper):
                         recieved_grad = torch.zeros_like(flat_grads_list[0])
                         dist.reduce_scatter(recieved_grad, flat_grads_list, group=bucket_store.torch_pg)
 
-                        if recieved_grad.dtype != grad_dtype:
-                            recieved_grad = recieved_grad.to(grad_dtype)
+                        if received_grad.dtype != grad_dtype:
+                            received_grad = received_grad.to(grad_dtype)
 
                         grad_in_bucket_current_rank = bucket_store.get_grad()[bucket_store.zero_local_rank]
                         LowLevelZeroOptimizer.update_partitoned_grad(
@@ -1019,3 +1020,6 @@ class LowLevelZeroOptimizer(OptimizerWrapper):
                 **self.moe_master_to_working_map,
             }
         return self._param_store.master_to_working_param
+
+    def get_param_padding_map(self) -> Dict[int, torch.Tensor]:
+        return self._param_store.get_padding_map()
