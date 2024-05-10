@@ -99,6 +99,7 @@ class HybridParallelCheckpointIO(GeneralCheckpointIO):
             if is_padded_tensor(param):
                 param = to_unpadded_tensor(param)
             param_ = gather_distributed_param(param, keep_vars=False)
+            param_ = param_.data
             block, block_size = state_dict_sharder.append_param(prefix + name, param_)
             if block is not None:
                 yield block, block_size
