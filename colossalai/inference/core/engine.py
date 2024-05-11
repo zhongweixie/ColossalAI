@@ -21,6 +21,7 @@ from colossalai.inference.batch_bucket import BatchBucket
 from colossalai.inference.config import InferenceConfig, InputMetaData
 from colossalai.inference.graph_runner import CUDAGraphRunner
 from colossalai.inference.modeling.policy import model_policy_map
+from colossalai.inference.sampler import search_tokens
 from colossalai.inference.spec import Drafter, GlideInput
 from colossalai.inference.struct import Sequence
 from colossalai.inference.utils import get_model_size, has_index_file
@@ -738,7 +739,7 @@ class InferenceEngine:
         logits = model_executable(input_token_ids, output_tensor, input_meta_data, self.k_cache, self.v_cache)
         if self.inference_config.pad_input:
             logits = logits[:, -1, :]
-        next_tokens = self.request_handler.search_tokens(self.generation_config, logits, batch)
+        next_tokens = search_tokens(self.generation_config, logits, input_meta_data.is_prompts)
         self.request_handler.append_next_tokens(next_tokens)
         finished_sequences = self.request_handler.update()
 
